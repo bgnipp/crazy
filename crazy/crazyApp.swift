@@ -656,8 +656,10 @@ final class AudioHapticsManager {
     
     func playBackgroundMusic() {
         guard GameSettings.soundtrackEnabled, backgroundMusicPlayer == nil else { return }
+        
+        // Note: The soundtrack file needs to be added to the Xcode project
         guard let url = Bundle.main.url(forResource: "crazy_soundtrack", withExtension: "m4a") else {
-            print("Could not find crazy_soundtrack.m4a")
+            print("RideRunner: crazy_soundtrack.m4a not found in bundle. Please add the soundtrack file to the Xcode project.")
             return
         }
         do {
@@ -665,9 +667,10 @@ final class AudioHapticsManager {
             try AVAudioSession.sharedInstance().setActive(true)
             backgroundMusicPlayer = try AVAudioPlayer(contentsOf: url)
             backgroundMusicPlayer?.numberOfLoops = -1
+            backgroundMusicPlayer?.volume = 0.5  // 50% volume to not overpower voice
             backgroundMusicPlayer?.play()
         } catch {
-            print("Could not load background music: \(error)")
+            print("RideRunner: Could not load background music: \(error)")
         }
     }
     
@@ -682,7 +685,12 @@ final class AudioHapticsManager {
     
     func resumeBackgroundMusic() {
         guard GameSettings.soundtrackEnabled else { return }
-        backgroundMusicPlayer?.play()
+        if backgroundMusicPlayer == nil {
+            // If player was deallocated for some reason, recreate it
+            playBackgroundMusic()
+        } else {
+            backgroundMusicPlayer?.play()
+        }
     }
     
     func playSpeedWarning() {
@@ -965,7 +973,8 @@ final class GameEngine: ObservableObject {
     
     private func maintainRiderPool() {
         let currentCount = riders.count
-        let targetCount = GameSettings.ridersToMaintain
+        // Use zone's calculated rider count based on area and density setting
+        let targetCount = zone.initialRiderCount
         let playerLocation = self.locationManager.currentLocation
         
         if currentCount < targetCount {
@@ -1383,6 +1392,10 @@ final class HUDView: UIView {
 
     override init(frame: CGRect) {
         super.init(frame: frame)
+        // Make the HUD view itself transparent to touches
+        backgroundColor = .clear
+        isUserInteractionEnabled = true
+        
         addSubview(timerLabel)
         addSubview(scoreLabel)
         addSubview(statusLabel)
@@ -1405,6 +1418,19 @@ final class HUDView: UIView {
         ])
     }
     required init?(coder: NSCoder) { fatalError() }
+    
+    // Override hit test to pass through touches except on actual labels
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        // Check if touch is on any of our labels
+        for subview in subviews {
+            let convertedPoint = subview.convert(point, from: self)
+            if subview.bounds.contains(convertedPoint) {
+                return subview
+            }
+        }
+        // Touch is not on any label, pass through to underlying views
+        return nil
+    }
 }
 
 // VC where user draws zone --------------------------------
@@ -1573,9 +1599,12 @@ final class GameVC: UIViewController, MKMapViewDelegate {
         title = "RideRunner"
         navigationItem.rightBarButtonItem = UIBarButtonItem(image: UIImage(systemName: "gear"), style: .plain, target: self, action: #selector(settingsTapped))
         checkLocationPermission()
-        setupMap()
-        setupHUD()
-        setupControls()
+        
+        // Setup views in correct order for touch handling
+        setupMap()      // Map at bottom
+        setupHUD()      // HUD overlay (with touch pass-through)
+        setupControls() // Control buttons on top
+        
         bindEngine()
         observeSettings()
     }
@@ -1629,6 +1658,13 @@ final class GameVC: UIViewController, MKMapViewDelegate {
         map.delegate = self
         map.showsUserLocation = true
         
+        // Enable user interaction during gameplay
+        map.isUserInteractionEnabled = true
+        map.isZoomEnabled = true
+        map.isScrollEnabled = true
+        map.isRotateEnabled = true
+        map.isPitchEnabled = true
+        
         // Add zone polygon overlay
         map.addOverlay(zone.polygon)
         updateMapCamera()
@@ -1642,19 +1678,24 @@ final class GameVC: UIViewController, MKMapViewDelegate {
     private func updateMapCamera() {
         map.mapType = MKMapType(rawValue: UInt(GameSettings.mapType)) ?? .hybridFlyover
         
-        let camera: MKMapCamera
-        if GameSettings.cameraTiltEnabled {
-            camera = MKMapCamera(lookingAtCenter: zone.polygon.boundingMapRect.center, fromDistance: 2000, pitch: 45, heading: 0)
-        } else {
-            camera = MKMapCamera(lookingAtCenter: zone.polygon.boundingMapRect.center, fromDistance: 3000, pitch: 0, heading: 0)
+        // Only set initial camera if game hasn't started yet
+        if engine.state == .ready {
+            let camera: MKMapCamera
+            if GameSettings.cameraTiltEnabled {
+                camera = MKMapCamera(lookingAtCenter: zone.polygon.boundingMapRect.center, fromDistance: 2000, pitch: 45, heading: 0)
+            } else {
+                camera = MKMapCamera(lookingAtCenter: zone.polygon.boundingMapRect.center, fromDistance: 3000, pitch: 0, heading: 0)
+            }
+            map.setCamera(camera, animated: true)
         }
-        map.setCamera(camera, animated: true)
+        // During gameplay, preserve user's camera position
     }
 
     private func setupHUD() {
         view.addSubview(hud)
         hud.frame = view.bounds
         hud.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        // HUD now handles touch pass-through via hitTest override
     }
     
     private func setupControls() {
@@ -1985,7 +2026,7 @@ final class SettingsVC: UITableViewController {
         switch Section(rawValue: section) {
         case .coreGame: return 4
         case .difficulty: return 4
-        case .visuals: return 3
+        case .visuals: return 4  // Changed from 3 to 4 to include soundtrack
         case .advanced: return 1
         default: return 0
         }
