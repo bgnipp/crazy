@@ -94,11 +94,6 @@ final class GameSettings {
         set { UserDefaults.standard.set(newValue, forKey: "rr_cameraTiltEnabled") }
     }
     
-    static var densityFactor: Int {
-        get { UserDefaults.standard.object(forKey: "rr_densityFactor") as? Int ?? 10 }
-        set { UserDefaults.standard.set(newValue, forKey: "rr_densityFactor") }
-    }
-    
     // POI Strategy
     static var poiMode: String {
         get { UserDefaults.standard.object(forKey: "rr_poiMode") as? String ?? "Smart" }
@@ -771,7 +766,8 @@ final class GameEngine: ObservableObject {
     
     private func observeSettings() {
         settingsObserver = NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.riderSelector = RiderSelectorFactory.create(mode: GameSettings.poiMode, zone: self!.zone)
+            guard let self = self else { return }
+            self.riderSelector = RiderSelectorFactory.create(mode: GameSettings.poiMode, zone: self.zone)
         }
     }
     
@@ -820,6 +816,7 @@ final class GameEngine: ObservableObject {
         timer?.cancel()
         timer = nil
         locationManager.setMode(.idle)
+        audioHaptics.stopBackgroundMusic()
         
         countdown = GameSettings.startTime
         score = 0
@@ -834,10 +831,10 @@ final class GameEngine: ObservableObject {
 
     // MARK: Timer & Game Loop
     private func tick() {
-        guard state == .playing && countdown > 0 else {
+        guard state == .playing else { return }
+        
         if countdown <= 0 {
-                gameOver()
-            }
+            gameOver()
             return
         }
         
@@ -856,10 +853,6 @@ final class GameEngine: ObservableObject {
         if countdown <= 10 && countdown > 9.5 {
             audioHaptics.playTenSecondsRemaining()
         }
-        
-        if countdown <= 0 {
-            gameOver()
-        }
     }
     
     private func gameOver() {
@@ -875,6 +868,7 @@ final class GameEngine: ObservableObject {
         }
         
         audioHaptics.playGameOver()
+        audioHaptics.stopBackgroundMusic()
     }
 
     // MARK: Location binding
@@ -2160,7 +2154,7 @@ final class GameVC: UIViewController, MKMapViewDelegate {
 final class SettingsVC: UITableViewController {
     
     private enum Section: Int, CaseIterable {
-        case coreGame, difficulty, visuals, advanced
+        case coreGame, difficulty, tierRewards, visuals, advanced
     }
     
     private let cellIdentifier = "settingCell"
@@ -2184,6 +2178,7 @@ final class SettingsVC: UITableViewController {
         switch Section(rawValue: section) {
         case .coreGame: return "Core Gameplay"
         case .difficulty: return "Difficulty"
+        case .tierRewards: return "Tier Rewards"
         case .visuals: return "Visuals & Map"
         case .advanced: return "Advanced"
         case .none: return nil
@@ -2196,6 +2191,8 @@ final class SettingsVC: UITableViewController {
             return "Adjust core mechanics like starting time, pickup radius, and how fatigue affects your rewards."
         case .difficulty:
             return "Customize the game's challenge. Rider density controls the area per rider. Tier probabilities adjust the chance of seeing high-value riders."
+        case .tierRewards:
+            return "Set the base time rewards for each tier of rider. Higher tiers give more time bonus."
         case .visuals:
             return "Change the map's appearance, enable accessibility options, and toggle the game's soundtrack."
         case .advanced:
@@ -2207,10 +2204,11 @@ final class SettingsVC: UITableViewController {
     
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
         switch Section(rawValue: section) {
-        case .coreGame: return 4
-        case .difficulty: return 5  // Added Max Riders
-        case .visuals: return 5  // Include all visual settings
-        case .advanced: return 1
+        case .coreGame: return 7  // Added minTripDistance, maxTripDistance, avgBikeSpeed
+        case .difficulty: return 8  // Added mediumTierChance, maxSpeed, poiMode
+        case .tierRewards: return 3  // Green, Yellow, Orange
+        case .visuals: return 5  // Keep as is
+        case .advanced: return 1  // Just restore defaults
         default: return 0
         }
     }
@@ -2223,6 +2221,8 @@ final class SettingsVC: UITableViewController {
             configureCoreGameCell(cell, for: indexPath.row)
         case .difficulty:
             configureDifficultyCell(cell, for: indexPath.row)
+        case .tierRewards:
+            configureTierRewardsCell(cell, for: indexPath.row)
         case .visuals:
             configureVisualsCell(cell, for: indexPath.row)
         case .advanced:
@@ -2255,6 +2255,24 @@ final class SettingsVC: UITableViewController {
                 cell.detailTextLabel?.text = "\(Int($0)) s"
             }
         case 3:
+            cell.textLabel?.text = "Min Trip Distance"
+            addSlider(to: cell, value: Float(GameSettings.minTripDistance), min: 20, max: 100) {
+                GameSettings.minTripDistance = CLLocationDistance($0)
+                cell.detailTextLabel?.text = "\(Int($0)) m"
+            }
+        case 4:
+            cell.textLabel?.text = "Max Trip Distance"
+            addSlider(to: cell, value: Float(GameSettings.maxTripDistance), min: 100, max: 500) {
+                GameSettings.maxTripDistance = CLLocationDistance($0)
+                cell.detailTextLabel?.text = "\(Int($0)) m"
+            }
+        case 5:
+            cell.textLabel?.text = "Avg Bike Speed"
+            addSlider(to: cell, value: Float(GameSettings.avgBikeSpeed), min: 2, max: 10) {
+                GameSettings.avgBikeSpeed = CLLocationSpeed($0)
+                cell.detailTextLabel?.text = String(format: "%.1f m/s", $0)
+            }
+        case 6:
             cell.textLabel?.text = "Fatigue Rate"
             addSlider(to: cell, value: Float(GameSettings.fatigueRate), min: 0.8, max: 1.0) {
                 GameSettings.fatigueRate = Double($0)
@@ -2270,28 +2288,45 @@ final class SettingsVC: UITableViewController {
             cell.textLabel?.text = "Speed Guard"
             addSwitch(to: cell, isOn: GameSettings.speedGuardEnabled) { GameSettings.speedGuardEnabled = $0 }
         case 1:
+            cell.textLabel?.text = "Max Speed"
+            addSlider(to: cell, value: Float(GameSettings.maxSpeed), min: 5, max: 15) {
+                GameSettings.maxSpeed = CLLocationSpeed($0)
+                cell.detailTextLabel?.text = String(format: "%.1f m/s", $0)
+            }
+        case 2:
             cell.textLabel?.text = "Rider Density"
             addSlider(to: cell, value: Float(GameSettings.areaPerRider), min: 25, max: 500) {
                 GameSettings.areaPerRider = Double($0)
                 cell.detailTextLabel?.text = "1 per \(Int($0)) m²"
             }
-        case 2:
+        case 3:
             cell.textLabel?.text = "Min Spawn Distance"
             addSlider(to: cell, value: Float(GameSettings.minSpawnDistanceFromPlayer), min: 15, max: 100) {
                 GameSettings.minSpawnDistanceFromPlayer = CLLocationDistance($0)
                 cell.detailTextLabel?.text = "\(Int($0)) m"
             }
-        case 3:
+        case 4:
             cell.textLabel?.text = "High Tier Chance"
             addSlider(to: cell, value: Float(GameSettings.highTierChance), min: 0.05, max: 0.5) {
                 GameSettings.highTierChance = Double($0)
                 cell.detailTextLabel?.text = "\(Int($0 * 100))%"
             }
-        case 4:
+        case 5:
+            cell.textLabel?.text = "Medium Tier Chance"
+            addSlider(to: cell, value: Float(GameSettings.mediumTierChance), min: 0.1, max: 0.6) {
+                GameSettings.mediumTierChance = Double($0)
+                cell.detailTextLabel?.text = "\(Int($0 * 100))%"
+            }
+        case 6:
             cell.textLabel?.text = "Max Riders"
             addSlider(to: cell, value: Float(GameSettings.maxRiders), min: 1, max: 50) {
                 GameSettings.maxRiders = Int($0)
                 cell.detailTextLabel?.text = "\(Int($0))"
+            }
+        case 7:
+            cell.textLabel?.text = "POI Strategy"
+            addSegmentedControl(to: cell, items: ["Random", "Curated", "Smart"], selectedIndex: GameSettings.poiMode == "Random" ? 0 : (GameSettings.poiMode == "Curated" ? 1 : 2)) {
+                GameSettings.poiMode = $0 == 0 ? "Random" : ($0 == 1 ? "Curated" : "Smart")
             }
         default: break
         }
@@ -2301,8 +2336,23 @@ final class SettingsVC: UITableViewController {
         switch row {
         case 0:
             cell.textLabel?.text = "Map Type"
-            addSegmentedControl(to: cell, items: ["Standard", "Satellite", "3D"], selectedIndex: GameSettings.mapType) {
-                GameSettings.mapType = $0
+            let mapType = MKMapType(rawValue: UInt(GameSettings.mapType))
+            let selectedIndex: Int
+            switch mapType {
+            case .standard: selectedIndex = 0
+            case .satellite, .hybrid: selectedIndex = 1
+            case .satelliteFlyover, .hybridFlyover: selectedIndex = 2
+            default: selectedIndex = 2
+            }
+            addSegmentedControl(to: cell, items: ["Standard", "Satellite", "3D"], selectedIndex: selectedIndex) { index in
+                let mapType: MKMapType
+                switch index {
+                case 0: mapType = .standard
+                case 1: mapType = .satelliteFlyover
+                case 2: mapType = .hybridFlyover
+                default: mapType = .hybridFlyover
+                }
+                GameSettings.mapType = Int(mapType.rawValue)
             }
         case 1:
             cell.textLabel?.text = "Camera Tilt"
@@ -2325,6 +2375,30 @@ final class SettingsVC: UITableViewController {
             cell.textLabel?.text = "Restore Defaults"
             cell.textLabel?.textColor = .systemRed
             cell.accessoryType = .disclosureIndicator
+        }
+    }
+    
+    private func configureTierRewardsCell(_ cell: UITableViewCell, for row: Int) {
+        switch row {
+        case 0:
+            cell.textLabel?.text = "Green Tier (High)"
+            addSlider(to: cell, value: Float(GameSettings.tierGreen), min: 10, max: 60) {
+                GameSettings.tierGreen = TimeInterval($0)
+                cell.detailTextLabel?.text = "\(Int($0)) s"
+            }
+        case 1:
+            cell.textLabel?.text = "Yellow Tier (Medium)"
+            addSlider(to: cell, value: Float(GameSettings.tierYellow), min: 5, max: 40) {
+                GameSettings.tierYellow = TimeInterval($0)
+                cell.detailTextLabel?.text = "\(Int($0)) s"
+            }
+        case 2:
+            cell.textLabel?.text = "Orange Tier (Low)"
+            addSlider(to: cell, value: Float(GameSettings.tierOrange), min: 3, max: 30) {
+                GameSettings.tierOrange = TimeInterval($0)
+                cell.detailTextLabel?.text = "\(Int($0)) s"
+            }
+        default: break
         }
     }
     
@@ -2360,22 +2434,9 @@ final class SettingsVC: UITableViewController {
     
     private func addSegmentedControl(to cell: UITableViewCell, items: [String], selectedIndex: Int, action: @escaping (Int) -> Void) {
         let segmentedControl = UISegmentedControl(items: items)
-        let mapType = MKMapType(rawValue: UInt(selectedIndex))
-        switch mapType {
-        case .standard: segmentedControl.selectedSegmentIndex = 0
-        case .satellite, .hybrid: segmentedControl.selectedSegmentIndex = 1
-        case .satelliteFlyover, .hybridFlyover: segmentedControl.selectedSegmentIndex = 2
-        default: segmentedControl.selectedSegmentIndex = 2
-        }
+        segmentedControl.selectedSegmentIndex = selectedIndex
         segmentedControl.addAction(UIAction { _ in
-            let mapType: MKMapType
-            switch segmentedControl.selectedSegmentIndex {
-            case 0: mapType = .standard
-            case 1: mapType = .satelliteFlyover
-            case 2: mapType = .hybridFlyover
-            default: mapType = .hybridFlyover
-            }
-            action(Int(mapType.rawValue))
+            action(segmentedControl.selectedSegmentIndex)
         }, for: .valueChanged)
         cell.accessoryView = segmentedControl
     }
