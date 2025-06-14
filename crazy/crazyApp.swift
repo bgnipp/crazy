@@ -48,14 +48,14 @@ final class GameSettings {
         set { UserDefaults.standard.set(newValue, forKey: "rr_avgBikeSpeed") }
     }
     
-    static var ridersToMaintain: Int {
-        get { UserDefaults.standard.object(forKey: "rr_ridersToMaintain") as? Int ?? 3 }
-        set { UserDefaults.standard.set(newValue, forKey: "rr_ridersToMaintain") }
-    }
-    
     static var areaPerRider: Double {
         get { UserDefaults.standard.object(forKey: "rr_areaPerRider") as? Double ?? 150.0 } // ~1600 sq ft, much sparser
         set { UserDefaults.standard.set(newValue, forKey: "rr_areaPerRider") }
+    }
+    
+    static var maxRiders: Int {
+        get { UserDefaults.standard.object(forKey: "rr_maxRiders") as? Int ?? 20 }
+        set { UserDefaults.standard.set(newValue, forKey: "rr_maxRiders") }
     }
     
     // Difficulty Settings
@@ -328,8 +328,11 @@ struct GameZone: Identifiable, Codable {
     
     var initialRiderCount: Int {
         let areaM2 = areaKm2 * 1_000_000
-        let count = Int(areaM2 / GameSettings.areaPerRider)
-        return max(1, count)
+        let densityBasedCount = Int(areaM2 / GameSettings.areaPerRider)
+        let cappedCount = min(densityBasedCount, GameSettings.maxRiders)
+        let finalCount = max(1, cappedCount)
+        print("RideRunner: Zone area: \(areaKm2) km² (\(Int(areaM2)) m²), areaPerRider: \(GameSettings.areaPerRider) m², density-based: \(densityBasedCount), maxRiders: \(GameSettings.maxRiders), final: \(finalCount)")
+        return finalCount
     }
     
     // Codable implementation for CLLocationCoordinate2D array
@@ -750,6 +753,7 @@ final class GameEngine: ObservableObject {
     private let speedWarningCooldown: TimeInterval = 3.0
     private var riderDwellTimers: [UUID: Date] = [:]
     private var settingsObserver: Any?
+    private var isSpawning = false
 
     init(zone: GameZone, locationManager: LocationManager) {
         self.zone = zone
@@ -774,7 +778,7 @@ final class GameEngine: ObservableObject {
     private func setupGame() {
         session = GameSession(zone: zone, startTime: Date())
         countdown = GameSettings.startTime
-        spawnInitialRiders()
+        // Don't spawn riders here - wait until game actually starts
         bindLocation()
         bindSpeedViolations()
     }
@@ -961,17 +965,29 @@ final class GameEngine: ObservableObject {
 
     // MARK: Rider Management
     private func spawnInitialRiders() {
+        guard !isSpawning else {
+            print("RideRunner: Deferring initial spawn, another spawn is in progress.")
+            return
+        }
         let targetCount = zone.initialRiderCount
         let playerLocation = self.locationManager.currentLocation
+        print("RideRunner: Spawning initial riders - target count: \(targetCount)")
+        isSpawning = true
         Task {
             let newRiders = await riderSelector.selectRiders(count: targetCount, existing: [], near: playerLocation)
             await MainActor.run {
                 self.riders = newRiders
+                print("RideRunner: Initial spawn complete - actual count: \(self.riders.count)")
+                self.isSpawning = false
             }
         }
     }
     
     private func maintainRiderPool() {
+        guard !isSpawning else {
+            print("RideRunner: Deferring pool maintenance, a spawn is in progress.")
+            return
+        }
         let currentCount = riders.count
         // Use zone's calculated rider count based on area and density setting
         let targetCount = zone.initialRiderCount
@@ -979,10 +995,13 @@ final class GameEngine: ObservableObject {
         
         if currentCount < targetCount {
             let needed = targetCount - currentCount
+            print("RideRunner: Maintaining rider pool - current: \(currentCount), target: \(targetCount), spawning: \(needed)")
+            isSpawning = true
             Task {
                 let newRiders = await riderSelector.selectRiders(count: needed, existing: riders, near: playerLocation)
                 await MainActor.run {
                     self.riders.append(contentsOf: newRiders)
+                    self.isSpawning = false
                 }
             }
         }
@@ -1060,10 +1079,20 @@ final class RandomRiderSelector: RiderSelector {
     }
     
     func selectRiders(count: Int, existing: [Rider], near playerLocation: CLLocation?) async -> [Rider] {
+        // Respect max riders limit
+        let currentTotal = existing.count
+        let maxAllowed = GameSettings.maxRiders
+        let actualCount = min(count, maxAllowed - currentTotal)
+        
+        guard actualCount > 0 else {
+            print("RideRunner: Already at max riders limit (\(maxAllowed))")
+            return []
+        }
+        
         var newRiders: [Rider] = []
         let minDistance = GameSettings.minSpawnDistanceFromPlayer
         
-        for _ in 0..<count {
+        for _ in 0..<actualCount {
             var coordinate: CLLocationCoordinate2D
             var attempts = 0
             let maxAttempts = 50
@@ -1131,6 +1160,16 @@ final class CuratedRiderSelector: RiderSelector {
     }
     
     func selectRiders(count: Int, existing: [Rider], near playerLocation: CLLocation?) async -> [Rider] {
+        // Respect max riders limit
+        let currentTotal = existing.count
+        let maxAllowed = GameSettings.maxRiders
+        let actualCount = min(count, maxAllowed - currentTotal)
+        
+        guard actualCount > 0 else {
+            print("RideRunner: Already at max riders limit (\(maxAllowed))")
+            return []
+        }
+        
         let minDistance = GameSettings.minSpawnDistanceFromPlayer
 
         // Filter POIs within zone and away from the player
@@ -1145,13 +1184,13 @@ final class CuratedRiderSelector: RiderSelector {
         
         guard !validPOIs.isEmpty else {
             // Fallback to random if no POIs meet criteria
-            return await RandomRiderSelector(zone: zone).selectRiders(count: count, existing: existing, near: playerLocation)
+            return await RandomRiderSelector(zone: zone).selectRiders(count: actualCount, existing: existing, near: playerLocation)
         }
         
         var riders: [Rider] = []
         let shuffledPOIs = validPOIs.shuffled()
         
-        for i in 0..<count {
+        for i in 0..<actualCount {
             let poi = shuffledPOIs[i % shuffledPOIs.count]
             let coordinate = CLLocationCoordinate2D(latitude: poi.lat, longitude: poi.lon)
             let rider = Rider(coordinate: coordinate, tier: poi.tier, 
@@ -1169,12 +1208,23 @@ final class SmartPOIRiderSelector: RiderSelector {
     private var cachedPOIs: [MKMapItem] = []
     private var lastCacheTime: Date = Date.distantPast
     private let cacheExpirationInterval: TimeInterval = 24 * 60 * 60  // 24 hours
+    private var usedPOIIndices: Set<Int> = []  // Track which POIs we've already used
     
     init(zone: GameZone) {
         self.zone = zone
     }
     
     func selectRiders(count: Int, existing: [Rider], near playerLocation: CLLocation?) async -> [Rider] {
+        // First check if we would exceed max riders
+        let currentTotal = existing.count
+        let maxAllowed = GameSettings.maxRiders
+        let actualCount = min(count, maxAllowed - currentTotal)
+        
+        guard actualCount > 0 else {
+            print("RideRunner: Already at max riders limit (\(maxAllowed))")
+            return []
+        }
+        
         var pois = await fetchPOIs()
         let minDistance = GameSettings.minSpawnDistanceFromPlayer
 
@@ -1184,30 +1234,43 @@ final class SmartPOIRiderSelector: RiderSelector {
         
         guard !pois.isEmpty else {
             // Fallback to random if no POIs found
-            return await RandomRiderSelector(zone: zone).selectRiders(count: count, existing: existing, near: playerLocation)
+            return await RandomRiderSelector(zone: zone).selectRiders(count: actualCount, existing: existing, near: playerLocation)
         }
         
         // Score and sort POIs
         let scoredPOIs = scorePOIs(pois)
         
+        // Only use POIs we haven't used before
         var riders: [Rider] = []
-        for i in 0..<min(count, scoredPOIs.count) {
-            let poi = scoredPOIs[i]
-            let tier = assignTierBasedOnScore(poi.score)
-            let coordinate = poi.item.placemark.coordinate
-            
-            let rider = Rider(coordinate: coordinate, tier: tier,
-                            poiName: poi.item.name, poiCategory: poi.category)
-            riders.append(rider)
+        var poiIndex = 0
+        
+        while riders.count < actualCount && poiIndex < scoredPOIs.count {
+            if !usedPOIIndices.contains(poiIndex) {
+                let poi = scoredPOIs[poiIndex]
+                let tier = assignTierBasedOnScore(poi.score)
+                let coordinate = poi.item.placemark.coordinate
+                
+                // Check if this location is already occupied by an existing rider
+                let isOccupied = existing.contains { $0.coordinate.distance(to: coordinate) < 10 }
+                
+                if !isOccupied {
+                    let rider = Rider(coordinate: coordinate, tier: tier,
+                                    poiName: poi.item.name, poiCategory: poi.category)
+                    riders.append(rider)
+                    usedPOIIndices.insert(poiIndex)
+                }
+            }
+            poiIndex += 1
         }
         
         // Fill remaining with random if needed
-        if riders.count < count {
-            let remaining = count - riders.count
+        if riders.count < actualCount {
+            let remaining = actualCount - riders.count
             let randomRiders = await RandomRiderSelector(zone: zone).selectRiders(count: remaining, existing: existing + riders, near: playerLocation)
             riders.append(contentsOf: randomRiders)
         }
         
+        print("RideRunner: SmartPOI selected \(riders.count) riders (requested: \(count), allowed: \(actualCount))")
         return riders
     }
     
@@ -1242,11 +1305,21 @@ final class SmartPOIRiderSelector: RiderSelector {
             }
         }
         
-        // Cache results
-        cachedPOIs = allPOIs
-        lastCacheTime = Date()
+        // De-duplicate and cap total POIs to prevent overwhelming numbers
+        let uniquePOIs = Array(Set(allPOIs))
+        // Cap POIs to a reasonable number based on max riders setting
+        let poiCap = min(200, GameSettings.maxRiders * 3) // Allow 3x max riders for variety
+        let cappedPOIs = Array(uniquePOIs.prefix(poiCap))
         
-        return allPOIs
+        print("RideRunner: Found \(allPOIs.count) raw POIs, \(uniquePOIs.count) unique, capped to \(cappedPOIs.count) (based on maxRiders: \(GameSettings.maxRiders))")
+
+        // Cache results
+        cachedPOIs = cappedPOIs
+        lastCacheTime = Date()
+        // Reset used indices when we refresh the cache
+        usedPOIIndices.removeAll()
+        
+        return cappedPOIs
     }
     
     private func scorePOIs(_ pois: [MKMapItem]) -> [(item: MKMapItem, score: Double, category: String)] {
@@ -1557,7 +1630,6 @@ final class ZoneVC: UIViewController, MKMapViewDelegate {
 final class GameVC: UIViewController, MKMapViewDelegate {
     private let map = MKMapView()
     private let hud = HUDView()
-    private let controlPanel = UIStackView()
     private let startButton: UIButton = {
         let button = UIButton(type: .system)
         button.setTitle("Start Game", for: .normal)
@@ -1565,6 +1637,7 @@ final class GameVC: UIViewController, MKMapViewDelegate {
         button.backgroundColor = .systemGreen
         button.setTitleColor(.white, for: .normal)
         button.layer.cornerRadius = 8
+        button.contentEdgeInsets = UIEdgeInsets(top: 8, left: 16, bottom: 8, right: 16)
         return button
     }()
     
@@ -1575,7 +1648,26 @@ final class GameVC: UIViewController, MKMapViewDelegate {
         button.backgroundColor = .systemOrange
         button.setTitleColor(.white, for: .normal)
         button.layer.cornerRadius = 8
+        button.contentEdgeInsets = UIEdgeInsets(top: 8, left: 16, bottom: 8, right: 16)
         button.isHidden = true
+        return button
+    }()
+    
+    private let centerButton: UIButton = {
+        let button = UIButton(type: .system)
+        button.setImage(UIImage(systemName: "location.circle.fill"), for: .normal)
+        button.backgroundColor = .systemBlue
+        button.tintColor = .white
+        button.layer.cornerRadius = 22
+        return button
+    }()
+    
+    private let followButton: UIButton = {
+        let button = UIButton(type: .system)
+        button.setImage(UIImage(systemName: "location.north.line.fill"), for: .normal)
+        button.backgroundColor = .systemGray
+        button.tintColor = .white
+        button.layer.cornerRadius = 22
         return button
     }()
 
@@ -1584,8 +1676,10 @@ final class GameVC: UIViewController, MKMapViewDelegate {
     private var cancellables = Set<AnyCancellable>()
     private let zone: GameZone
     private var riderAnnotations: [String: RiderAnnotation] = [:]
+    private var riderRadiusOverlays: [String: MKCircle] = [:]
     private var userLocationView: MKAnnotationView?
     private var settingsObserver: Any?
+    private var isFollowingUser = false
 
     init(zone: GameZone) {
         self.zone = zone
@@ -1618,6 +1712,7 @@ final class GameVC: UIViewController, MKMapViewDelegate {
     private func observeSettings() {
         settingsObserver = NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.updateMapCamera()
+            self?.updateRadiusOverlays()
         }
     }
     
@@ -1699,24 +1794,44 @@ final class GameVC: UIViewController, MKMapViewDelegate {
     }
     
     private func setupControls() {
-        controlPanel.axis = .horizontal
-        controlPanel.spacing = 16
-        controlPanel.distribution = .fillEqually
-        controlPanel.translatesAutoresizingMaskIntoConstraints = false
+        // Add buttons directly to the view, not in a stack view
+        view.addSubview(startButton)
+        view.addSubview(pauseButton)
+        view.addSubview(centerButton)
+        view.addSubview(followButton)
         
-        controlPanel.addArrangedSubview(startButton)
-        controlPanel.addArrangedSubview(pauseButton)
-        view.addSubview(controlPanel)
+        // Disable autoresizing masks for Auto Layout
+        startButton.translatesAutoresizingMaskIntoConstraints = false
+        pauseButton.translatesAutoresizingMaskIntoConstraints = false
+        centerButton.translatesAutoresizingMaskIntoConstraints = false
+        followButton.translatesAutoresizingMaskIntoConstraints = false
         
         NSLayoutConstraint.activate([
-            controlPanel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            controlPanel.bottomAnchor.constraint(equalTo: hud.statusLabel.topAnchor, constant: -20),
-            controlPanel.widthAnchor.constraint(equalToConstant: 280),
-            controlPanel.heightAnchor.constraint(equalToConstant: 50)
+            // Constrain Start Button
+            startButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            startButton.bottomAnchor.constraint(equalTo: hud.statusLabel.topAnchor, constant: -20),
+            
+            // Constrain Pause button to the same position as the Start button
+            pauseButton.centerXAnchor.constraint(equalTo: startButton.centerXAnchor),
+            pauseButton.centerYAnchor.constraint(equalTo: startButton.centerYAnchor),
+            
+            // Center button
+            centerButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -20),
+            centerButton.bottomAnchor.constraint(equalTo: followButton.topAnchor, constant: -10),
+            centerButton.widthAnchor.constraint(equalToConstant: 44),
+            centerButton.heightAnchor.constraint(equalToConstant: 44),
+            
+            // Follow button
+            followButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -20),
+            followButton.bottomAnchor.constraint(equalTo: startButton.topAnchor, constant: -20), // Anchor to button
+            followButton.widthAnchor.constraint(equalToConstant: 44),
+            followButton.heightAnchor.constraint(equalToConstant: 44)
         ])
         
         startButton.addTarget(self, action: #selector(startButtonTapped), for: .touchUpInside)
         pauseButton.addTarget(self, action: #selector(pauseButtonTapped), for: .touchUpInside)
+        centerButton.addTarget(self, action: #selector(centerButtonTapped), for: .touchUpInside)
+        followButton.addTarget(self, action: #selector(followButtonTapped), for: .touchUpInside)
     }
 
     @objc private func startButtonTapped() {
@@ -1735,6 +1850,23 @@ final class GameVC: UIViewController, MKMapViewDelegate {
             engine.pause()
         } else if engine.state == .paused {
             engine.resume()
+        }
+    }
+    
+    @objc private func centerButtonTapped() {
+        guard let userLocation = locationManager.currentLocation else { return }
+        let region = MKCoordinateRegion(center: userLocation.coordinate, latitudinalMeters: 500, longitudinalMeters: 500)
+        map.setRegion(region, animated: true)
+    }
+    
+    @objc private func followButtonTapped() {
+        isFollowingUser.toggle()
+        followButton.backgroundColor = isFollowingUser ? .systemBlue : .systemGray
+        
+        if isFollowingUser {
+            map.userTrackingMode = .followWithHeading
+        } else {
+            map.userTrackingMode = .none
         }
     }
 
@@ -1823,11 +1955,14 @@ final class GameVC: UIViewController, MKMapViewDelegate {
         let currentRiderIds = Set(riderAnnotations.keys)
         let newRiderIds = Set(riders.map { $0.id.uuidString })
         
-        // Remove annotations for riders that no longer exist
+        // Remove annotations and overlays for riders that no longer exist
         let ridersToRemove = currentRiderIds.subtracting(newRiderIds)
         for riderId in ridersToRemove {
             if let annotation = riderAnnotations.removeValue(forKey: riderId) {
                 map.removeAnnotation(annotation)
+            }
+            if let overlay = riderRadiusOverlays.removeValue(forKey: riderId) {
+                map.removeOverlay(overlay)
             }
         }
         
@@ -1837,6 +1972,32 @@ final class GameVC: UIViewController, MKMapViewDelegate {
             let annotation = RiderAnnotation(rider: rider, kind: .pickup)
             riderAnnotations[rider.id.uuidString] = annotation
             map.addAnnotation(annotation)
+            
+            // Add radius overlay if enabled
+            if GameSettings.showRadii {
+                let circle = MKCircle(center: rider.coordinate, radius: GameSettings.pickupRadius)
+                riderRadiusOverlays[rider.id.uuidString] = circle
+                map.addOverlay(circle)
+            }
+        }
+    }
+    
+    private func updateRadiusOverlays() {
+        if GameSettings.showRadii {
+            // Add overlays for all riders if not already present
+            for (riderId, annotation) in riderAnnotations {
+                if riderRadiusOverlays[riderId] == nil {
+                    let circle = MKCircle(center: annotation.coordinate, radius: GameSettings.pickupRadius)
+                    riderRadiusOverlays[riderId] = circle
+                    map.addOverlay(circle)
+                }
+            }
+        } else {
+            // Remove all radius overlays
+            for overlay in riderRadiusOverlays.values {
+                map.removeOverlay(overlay)
+            }
+            riderRadiusOverlays.removeAll()
         }
     }
     
@@ -1873,6 +2034,12 @@ final class GameVC: UIViewController, MKMapViewDelegate {
             renderer.strokeColor = .systemTeal
             renderer.lineWidth = 2
             return renderer
+        } else if let circle = overlay as? MKCircle {
+            let renderer = MKCircleRenderer(circle: circle)
+            renderer.strokeColor = UIColor.systemBlue.withAlphaComponent(0.5)
+            renderer.fillColor = UIColor.systemBlue.withAlphaComponent(0.1)
+            renderer.lineWidth = 1
+            return renderer
         }
         return MKOverlayRenderer()
     }
@@ -1900,6 +2067,9 @@ final class GameVC: UIViewController, MKMapViewDelegate {
         annotationView.markerTintColor = riderAnnotation.color
         annotationView.glyphImage = UIImage(systemName: riderAnnotation.sfSymbol)
         
+        // Set display priority to required to prevent MapKit from hiding annotations at different zoom levels.
+        annotationView.displayPriority = .required
+        
         // Add pulsing animation for high-tier riders
         if riderAnnotation.tier.shouldPulse && riderAnnotation.kind == .pickup {
             addPulseAnimation(to: annotationView)
@@ -1907,7 +2077,20 @@ final class GameVC: UIViewController, MKMapViewDelegate {
             annotationView.layer.removeAnimation(forKey: "pulse")
         }
         
+        // Make destination flag larger and reset transform for reused pickup views
+        if riderAnnotation.kind == .destination {
+            annotationView.transform = CGAffineTransform(scaleX: 1.5, y: 1.5)
+        } else {
+            annotationView.transform = .identity
+        }
+        
         return annotationView
+    }
+    
+    func mapView(_ mapView: MKMapView, didChange mode: MKUserTrackingMode, animated: Bool) {
+        // Update follow button state when user manually changes tracking mode
+        isFollowingUser = (mode == .follow || mode == .followWithHeading)
+        followButton.backgroundColor = isFollowingUser ? .systemBlue : .systemGray
     }
     
     private func addPulseAnimation(to view: MKAnnotationView) {
@@ -2025,8 +2208,8 @@ final class SettingsVC: UITableViewController {
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
         switch Section(rawValue: section) {
         case .coreGame: return 4
-        case .difficulty: return 4
-        case .visuals: return 4  // Changed from 3 to 4 to include soundtrack
+        case .difficulty: return 5  // Added Max Riders
+        case .visuals: return 5  // Include all visual settings
         case .advanced: return 1
         default: return 0
         }
@@ -2104,6 +2287,12 @@ final class SettingsVC: UITableViewController {
                 GameSettings.highTierChance = Double($0)
                 cell.detailTextLabel?.text = "\(Int($0 * 100))%"
             }
+        case 4:
+            cell.textLabel?.text = "Max Riders"
+            addSlider(to: cell, value: Float(GameSettings.maxRiders), min: 1, max: 50) {
+                GameSettings.maxRiders = Int($0)
+                cell.detailTextLabel?.text = "\(Int($0))"
+            }
         default: break
         }
     }
@@ -2124,6 +2313,9 @@ final class SettingsVC: UITableViewController {
         case 3:
             cell.textLabel?.text = "Soundtrack"
             addSwitch(to: cell, isOn: GameSettings.soundtrackEnabled) { GameSettings.soundtrackEnabled = $0 }
+        case 4:
+            cell.textLabel?.text = "Show Pickup Radius"
+            addSwitch(to: cell, isOn: GameSettings.showRadii) { GameSettings.showRadii = $0 }
         default: break
         }
     }
